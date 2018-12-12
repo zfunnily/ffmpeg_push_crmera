@@ -9,6 +9,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+int flush_encoder(AVFormatContext *ifmt_ctx, AVFormatContext *ofmt_ctx, unsigned int stream_index, int framecnt);
+
 void show_dshow_device()
 {
 	AVFormatContext *pFmtCtx = avformat_alloc_context();
@@ -35,6 +37,7 @@ int main ()
 
 	//Show Dshow Device  
 	show_dshow_device();
+	const char* out_path = "rtmp://192.168.1.22:1935/live/test";
 
 	char capture_name[100] = {0},device_name[100] ={0};
 
@@ -55,7 +58,8 @@ int main ()
 	//3.vcodec_find_encoder()和avcodec_find_decoder()。
 	//avcodec_find_encoder()用于查找FFmpeg的编码器，avcodec_find_decoder()用于查找FFmpeg的解码器
 	//=================
-	if (avformat_open_input(&ifmt_ctx,device_name,ifmt,NULL) != 0) {  
+	AVDictionary *device_param = 0;
+	if (avformat_open_input(&ifmt_ctx,device_name,ifmt,&device_param) != 0) {  
 		printf("Couldn't open input stream.（无法打开输入流）\n");
 		return -1;
 	}
@@ -87,7 +91,6 @@ int main ()
 	//==============================
 	AVFormatContext* ofmt_ctx = avformat_alloc_context();
 	AVOutputFormat *ofmt = NULL;
-	const char* out_path = "rtmp://192.168.1.22/live/test";
 	avformat_alloc_output_context2(&ofmt_ctx,NULL,"flv",out_path);
 
 	//output encode initialize 
@@ -140,62 +143,101 @@ int main ()
 		goto end;
 	}
 
+	AVPacket *dec_pkt, enc_pkt;
+	 dec_pkt = (AVPacket *)av_malloc(sizeof(AVPacket));
+
+	 	//camera data may has a pix fmt of RGB or sth else,convert it to YUV420
+	struct SwsContext * img_convert_ctx = sws_getContext(ifmt_ctx->streams[videoindex]->codec->width, ifmt_ctx->streams[videoindex]->codec->height,
+		 ifmt_ctx->streams[videoindex]->codec->pix_fmt, pCodecCtx->width, pCodecCtx->height, PIX_FMT_YUV420P, SWS_BICUBIC, NULL, NULL, NULL);
+
+	//Initialize the buffer to store YUV frames to be encoded.
+	AVFrame *pFrameYUV = av_frame_alloc();
+	uint8_t *out_buffer = (uint8_t *)av_malloc(avpicture_get_size(PIX_FMT_YUV420P, pCodecCtx->width, pCodecCtx->height));
+	avpicture_fill((AVPicture *)pFrameYUV, out_buffer, PIX_FMT_YUV420P, pCodecCtx->width, pCodecCtx->height);
+	 printf("\n --------call started----------\n");
+
+
+
 	//start push
-	AVPacket pkt;
-	int frame_index=0;
-	int64_t start_time=av_gettime();
-	while(1) {
-		AVStream *in_stream, *out_stream;
-		//Get an AVPacket
-		ret = av_read_frame(ifmt_ctx, &pkt);
-		if (ret < 0)
-			break;
-		//FIX：No PTS (Example: Raw H.264)
-		//Simple Write PTS
-		if(pkt.pts==AV_NOPTS_VALUE){
-			//Write PTS
-			AVRational time_base1=ifmt_ctx->streams[videoindex]->time_base;
-			//Duration between 2 frames (us)
-			int64_t calc_duration=(double)AV_TIME_BASE/av_q2d(ifmt_ctx->streams[videoindex]->r_frame_rate);
-			//Parameters
-			pkt.pts=(double)(frame_index*calc_duration)/(double)(av_q2d(time_base1)*AV_TIME_BASE);
-			pkt.dts=pkt.pts;
-			pkt.duration=(double)calc_duration/(double)(av_q2d(time_base1)*AV_TIME_BASE);
-		}
-		//Important:Delay
-		if(pkt.stream_index==videoindex){
-			AVRational time_base=ifmt_ctx->streams[videoindex]->time_base;
-			AVRational time_base_q={1,AV_TIME_BASE};
-			int64_t pts_time = av_rescale_q(pkt.dts, time_base, time_base_q);
-			int64_t now_time = av_gettime() - start_time;
-			if (pts_time > now_time)
-				av_usleep(pts_time - now_time);
-		}in_stream  = ifmt_ctx->streams[pkt.stream_index];
-		out_stream = ofmt_ctx->streams[pkt.stream_index];
-		/* copy packet */
-		//Convert PTS/DTS
-		pkt.pts = av_rescale_q_rnd(pkt.pts, in_stream->time_base, out_stream->time_base, (AVRounding)(AV_ROUND_NEAR_INF|AV_ROUND_PASS_MINMAX));
-		pkt.dts = av_rescale_q_rnd(pkt.dts, in_stream->time_base, out_stream->time_base, (AVRounding)(AV_ROUND_NEAR_INF|AV_ROUND_PASS_MINMAX));
-		pkt.duration = av_rescale_q(pkt.duration, in_stream->time_base, out_stream->time_base);
-		pkt.pos = -1;
-		//Print to Screen
-		if(pkt.stream_index==videoindex){
-			printf("Send %8d video frames to output URL\n",frame_index);
-			frame_index++;
-		}
-		//ret = av_write_frame(ofmt_ctx, &pkt);
-		ret = av_interleaved_write_frame(ofmt_ctx, &pkt);
+	int frame_index = 0;
+	int start_time=av_gettime();
+	AVFrame *pframe;
+	int dec_got_frame, enc_got_frame;
+	int framecnt = 0;
+	AVRational time_base_q = { 1, AV_TIME_BASE };
+	int vid_next_pts = 0;
+	int aud_next_pts = 0;
+	while (1) {
+		if ((ret=av_read_frame(ifmt_ctx, dec_pkt)) >= 0){
 
-		if (ret < 0) {
-			printf( "Error muxing packet\n");
-			break;
+			av_log(NULL, AV_LOG_DEBUG, "Going to reencode the frame\n");
+			pframe = av_frame_alloc();
+			if (!pframe) {
+				ret = AVERROR(ENOMEM);
+				return ret;
+			}
+			ret = avcodec_decode_video2(ifmt_ctx->streams[dec_pkt->stream_index]->codec, pframe,
+				&dec_got_frame, dec_pkt);
+			if (ret < 0) {
+				av_frame_free(&pframe);
+				av_log(NULL, AV_LOG_ERROR, "Decoding failed\n");
+				break;
+			}
+			if (dec_got_frame){
+				sws_scale(img_convert_ctx, (const uint8_t* const*)pframe->data, pframe->linesize, 0, pCodecCtx->height, pFrameYUV->data, pFrameYUV->linesize);
+				pFrameYUV->width = pframe->width;
+				pFrameYUV->height = pframe->height;
+				pFrameYUV->format = PIX_FMT_YUV420P;
+
+				enc_pkt.data = NULL;
+				enc_pkt.size = 0;
+				av_init_packet(&enc_pkt);
+				ret = avcodec_encode_video2(pCodecCtx, &enc_pkt, pFrameYUV, &enc_got_frame);
+				av_frame_free(&pframe);
+				if (enc_got_frame == 1){
+					//printf("Succeed to encode frame: %5d\tsize:%5d\n", framecnt, enc_pkt.size);
+					framecnt++;
+					enc_pkt.stream_index = video_st->index;						
+
+					//Write PTS
+					AVRational time_base = ofmt_ctx->streams[0]->time_base;//{ 1, 1000 };
+					AVRational r_framerate1 = ifmt_ctx->streams[videoindex]->r_frame_rate;//{ 50, 2 }; 
+					//Duration between 2 frames (us)
+					int64_t calc_duration = (double)(AV_TIME_BASE)*(1 / av_q2d(r_framerate1));	//内部时间戳
+					//Parameters
+					//enc_pkt.pts = (double)(framecnt*calc_duration)*(double)(av_q2d(time_base_q)) / (double)(av_q2d(time_base));
+					enc_pkt.pts = av_rescale_q(framecnt*calc_duration, time_base_q, time_base);
+					enc_pkt.dts = enc_pkt.pts;
+					enc_pkt.duration = av_rescale_q(calc_duration, time_base_q, time_base); //(double)(calc_duration)*(double)(av_q2d(time_base_q)) / (double)(av_q2d(time_base));
+					enc_pkt.pos = -1;
+					//printf("video pts : %d\n", enc_pkt.pts);
+
+					vid_next_pts=framecnt*calc_duration; //general timebase
+
+					//Delay
+					int64_t pts_time = av_rescale_q(enc_pkt.pts, time_base, time_base_q);
+					int64_t now_time = av_gettime() - start_time;						
+					if ((pts_time > now_time) && ((vid_next_pts + pts_time - now_time)<aud_next_pts))
+						av_usleep(pts_time - now_time);
+
+					ret = av_interleaved_write_frame(ofmt_ctx, &enc_pkt);
+					av_free_packet(&enc_pkt);
+				}
+			}else {
+				av_frame_free(&pframe);
+			}
+		av_free_packet(dec_pkt);
 		}
-
-		av_free_packet(&pkt);
-
 	}
-	//Write file trailer
-	av_write_trailer(ofmt_ctx);
+		//Flush Encoder
+		ret = flush_encoder(ifmt_ctx, ofmt_ctx, 0, framecnt);
+		if (ret < 0) {
+			printf("Flushing encoder failed\n");
+			return -1;
+		}
+
+		//Write file trailer
+		av_write_trailer(ofmt_ctx);
 
 end:
 	avformat_close_input(&ifmt_ctx);
@@ -208,4 +250,51 @@ end:
 		return -1;
 	}
 	return 0;
+}
+
+int flush_encoder(AVFormatContext *ifmt_ctx, AVFormatContext *ofmt_ctx, unsigned int stream_index, int framecnt){
+	int ret;
+	int got_frame;
+	AVPacket enc_pkt;
+	if (!(ofmt_ctx->streams[stream_index]->codec->codec->capabilities &
+		CODEC_CAP_DELAY))
+		return 0;
+	while (1) {
+		enc_pkt.data = NULL;
+		enc_pkt.size = 0;
+		av_init_packet(&enc_pkt);
+		ret = avcodec_encode_video2(ofmt_ctx->streams[stream_index]->codec, &enc_pkt,
+			NULL, &got_frame);
+		av_frame_free(NULL);
+		if (ret < 0)
+			break;
+		if (!got_frame){
+			ret = 0;
+			break;
+		}
+		printf("Flush Encoder: Succeed to encode 1 frame!\tsize:%5d\n", enc_pkt.size);
+		framecnt++;
+		//Write PTS
+		AVRational time_base = ofmt_ctx->streams[stream_index]->time_base;//{ 1, 1000 };
+		AVRational r_framerate1 = ifmt_ctx->streams[0]->r_frame_rate;// { 50, 2 };
+		AVRational time_base_q = { 1, AV_TIME_BASE };
+		//Duration between 2 frames (us)
+		int64_t calc_duration = (double)(AV_TIME_BASE)*(1 / av_q2d(r_framerate1));	//内部时间戳
+		//Parameters
+		enc_pkt.pts = av_rescale_q(framecnt*calc_duration, time_base_q, time_base);
+		enc_pkt.dts = enc_pkt.pts;
+		enc_pkt.duration = av_rescale_q(calc_duration, time_base_q, time_base);
+
+		/* copy packet*/
+		//转换PTS/DTS（Convert PTS/DTS）
+		enc_pkt.pos = -1;
+
+		//ofmt_ctx->duration = enc_pkt.duration * framecnt;
+
+		/* mux encoded frame */
+		ret = av_interleaved_write_frame(ofmt_ctx, &enc_pkt);
+		if (ret < 0)
+			break;
+	}
+	return ret;
 }
